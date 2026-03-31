@@ -19,10 +19,32 @@ import torch.nn.functional as F
 
 from kernels import get_kernel
 cap = torch.cuda.get_device_capability()
+gpu_props = torch.cuda.get_device_properties(0)
+gpu_name = gpu_props.name
+gpu_vram_gib = gpu_props.total_memory / 1024 / 1024 / 1024
 
 
-def _select_attention_backend(capability):
-    backend = os.environ.get("AUTORESEARCH_ATTN_BACKEND", "auto").strip().lower()
+def _detect_gpu_profile(name, capability, vram_gib):
+    if "RTX 5090" in name and capability[0] >= 12 and vram_gib >= 28:
+        return {
+            "name": "rtx5090",
+            "attention_backend": "sdpa",
+            "device_batch_size": 32,
+            "use_torch_compile": False,
+        }
+    return {
+        "name": "generic",
+        "attention_backend": "auto",
+        "device_batch_size": None,
+        "use_torch_compile": None,
+    }
+
+
+GPU_PROFILE = _detect_gpu_profile(gpu_name, cap, gpu_vram_gib)
+
+
+def _select_attention_backend(capability, default_backend):
+    backend = os.environ.get("AUTORESEARCH_ATTN_BACKEND", default_backend).strip().lower()
     if backend not in {"auto", "fa3", "sdpa"}:
         raise ValueError(f"Unsupported attention backend override: {backend}")
 
@@ -49,7 +71,7 @@ def _select_attention_backend(capability):
     return "torch-sdpa", None
 
 
-ATTN_BACKEND_NAME, FLASH_ATTN_FUNC = _select_attention_backend(cap)
+ATTN_BACKEND_NAME, FLASH_ATTN_FUNC = _select_attention_backend(cap, GPU_PROFILE["attention_backend"])
 ATTN_MASK_CACHE = {}
 
 from prepare import MAX_SEQ_LEN, TIME_BUDGET, Tokenizer, make_dataloader, evaluate_bpb
@@ -522,8 +544,6 @@ torch.cuda.manual_seed(42)
 torch.set_float32_matmul_precision("high")
 device = torch.device("cuda")
 autocast_ctx = torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16)
-gpu_props = torch.cuda.get_device_properties(device)
-gpu_vram_gib = gpu_props.total_memory / 1024 / 1024 / 1024
 GPU_BF16_PEAK_FLOPS = {
     (9, 0): 989.5e12,  # H100 SXM
 }.get(cap)
@@ -531,21 +551,27 @@ GPU_BF16_PEAK_FLOPS = {
 device_batch_size_override = os.environ.get("AUTORESEARCH_DEVICE_BATCH_SIZE")
 if device_batch_size_override is not None:
     device_batch_size = int(device_batch_size_override)
+elif GPU_PROFILE["device_batch_size"] is not None:
+    device_batch_size = GPU_PROFILE["device_batch_size"]
 else:
     device_batch_size = DEFAULT_DEVICE_BATCH_SIZE if gpu_vram_gib >= 48 else 64
 
 compile_override = os.environ.get("AUTORESEARCH_COMPILE", "auto").strip().lower()
 if compile_override not in {"auto", "0", "1", "false", "true"}:
     raise ValueError(f"Unsupported AUTORESEARCH_COMPILE value: {compile_override}")
-use_torch_compile = (
-    compile_override == "1"
-    or compile_override == "true"
-    or (compile_override == "auto" and FLASH_ATTN_FUNC is not None)
-)
+if compile_override in {"1", "true"}:
+    use_torch_compile = True
+elif compile_override in {"0", "false"}:
+    use_torch_compile = False
+elif GPU_PROFILE["use_torch_compile"] is not None:
+    use_torch_compile = GPU_PROFILE["use_torch_compile"]
+else:
+    use_torch_compile = FLASH_ATTN_FUNC is not None
 
 print(
-    f"GPU: {gpu_props.name} | capability: {cap[0]}.{cap[1]} | VRAM: {gpu_vram_gib:.1f} GiB | "
-    f"attention: {ATTN_BACKEND_NAME} | torch.compile: {'on' if use_torch_compile else 'off'}"
+    f"GPU: {gpu_name} | capability: {cap[0]}.{cap[1]} | VRAM: {gpu_vram_gib:.1f} GiB | "
+    f"profile: {GPU_PROFILE['name']} | attention: {ATTN_BACKEND_NAME} | "
+    f"torch.compile: {'on' if use_torch_compile else 'off'}"
 )
 
 tokenizer = Tokenizer.from_directory()
@@ -579,7 +605,15 @@ num_flops_per_token = model.estimate_flops()
 print(f"Estimated FLOPs per token: {num_flops_per_token:e}")
 
 tokens_per_fwdbwd = device_batch_size * MAX_SEQ_LEN
-assert TOTAL_BATCH_SIZE % tokens_per_fwdbwd == 0
+if TOTAL_BATCH_SIZE % tokens_per_fwdbwd != 0:
+    valid_batch_sizes = [
+        batch for batch in range(1, TOTAL_BATCH_SIZE // MAX_SEQ_LEN + 1)
+        if TOTAL_BATCH_SIZE % (batch * MAX_SEQ_LEN) == 0
+    ]
+    raise ValueError(
+        f"Invalid device batch size {device_batch_size}. It must divide TOTAL_BATCH_SIZE / MAX_SEQ_LEN "
+        f"({TOTAL_BATCH_SIZE // MAX_SEQ_LEN}). Valid values: {valid_batch_sizes}"
+    )
 grad_accum_steps = TOTAL_BATCH_SIZE // tokens_per_fwdbwd
 
 optimizer = model.setup_optimizer(
