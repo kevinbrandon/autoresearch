@@ -22,6 +22,13 @@ Once you get confirmation, kick off the experimentation.
 
 Each experiment runs on a single GPU. The training script runs for a **fixed time budget of 5 minutes** (wall clock training time, excluding startup/compilation). You launch it simply as: `uv run train.py`.
 
+**This machine's baseline profile**: NVIDIA GeForce RTX 5090 32 GB. The repo now auto-detects this GPU and defaults to a safer runtime profile:
+- `AUTORESEARCH_ATTN_BACKEND=torch-sdpa`
+- `AUTORESEARCH_DEVICE_BATCH_SIZE=32`
+- `AUTORESEARCH_COMPILE=0`
+
+Treat that auto-detected 5090 profile as the default baseline unless you have a specific reason to override it.
+
 **What you CAN do:**
 - Modify `train.py` — this is the only file you edit. Everything is fair game: model architecture, optimizer, hyperparameters, training loop, batch size, model size, etc.
 
@@ -37,6 +44,12 @@ Each experiment runs on a single GPU. The training script runs for a **fixed tim
 **Simplicity criterion**: All else being equal, simpler is better. A small improvement that adds ugly complexity is not worth it. Conversely, removing something and getting equal or better results is a great outcome — that's a simplification win. When evaluating whether to keep a change, weigh the complexity cost against the improvement magnitude. A 0.001 val_bpb improvement that adds 20 lines of hacky code? Probably not worth it. A 0.001 val_bpb improvement from deleting code? Definitely keep. An improvement of ~0 but much simpler code? Keep.
 
 **The first run**: Your very first run should always be to establish the baseline, so you will run the training script as is.
+
+**5090-specific guardrails**:
+- A run with effective `AUTORESEARCH_DEVICE_BATCH_SIZE=64` has already failed on this machine. Do not retry 64 unchanged.
+- Only revisit batch size 64 after you have first changed some other memory pressure knob in `train.py` enough to make the comparison meaningful, such as lowering model width, depth, sequence-adjacent activation memory, or another VRAM-heavy component.
+- Prefer memory-safe iterations over repeated OOM probing. A crash that teaches nothing is wasted budget.
+- If startup prints `profile: rtx5090`, `attention: torch-sdpa`, and `torch.compile: off`, that is the expected baseline configuration.
 
 ## Output format
 
@@ -102,6 +115,11 @@ LOOP FOREVER:
 7. Record the results in the tsv (NOTE: do not commit the results.tsv file, leave it untracked by git)
 8. If val_bpb improved (lower), you "advance" the branch, keeping the git commit
 9. If val_bpb is equal or worse, you git reset back to where you started
+
+Additional loop guidance for this machine:
+- If a run crashes with OOM, do not immediately rerun the same idea with the same memory footprint. First reduce memory pressure or abandon the idea.
+- When trying larger models or more aggressive settings, make only one major VRAM-increasing move at a time so the cause of any crash is obvious.
+- Use the stable 5090 baseline as the anchor point for comparisons. The objective is better `val_bpb`, not repeatedly rediscovering hardware limits.
 
 The idea is that you are a completely autonomous researcher trying things out. If they work, keep. If they don't, discard. And you're advancing the branch so that you can iterate. If you feel like you're getting stuck in some way, you can rewind but you should probably do this very very sparingly (if ever).
 
