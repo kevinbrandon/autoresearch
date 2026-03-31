@@ -19,9 +19,38 @@ import torch.nn.functional as F
 
 from kernels import get_kernel
 cap = torch.cuda.get_device_capability()
-# varunneal's FA3 is Hopper only, use kernels-community on non-Hopper GPUs
-repo = "varunneal/flash-attention-3" if cap == (9, 0) else "kernels-community/flash-attn3"
-fa3 = get_kernel(repo).flash_attn_interface
+
+
+def _select_attention_backend(capability):
+    backend = os.environ.get("AUTORESEARCH_ATTN_BACKEND", "auto").strip().lower()
+    if backend not in {"auto", "fa3", "sdpa"}:
+        raise ValueError(f"Unsupported attention backend override: {backend}")
+
+    repo = None
+    if capability == (9, 0):
+        repo = "varunneal/flash-attention-3"
+    elif capability[0] in (8, 9):
+        repo = "kernels-community/flash-attn3"
+
+    if backend == "sdpa":
+        return "torch-sdpa", None
+    if backend == "fa3" and repo is None:
+        raise RuntimeError(
+            f"FlashAttention-3 override requested, but CUDA capability {capability[0]}.{capability[1]} "
+            "is outside the supported kernel set for this repo."
+        )
+    if repo is not None:
+        try:
+            return f"flash-attn3 ({repo})", get_kernel(repo).flash_attn_interface.flash_attn_func
+        except Exception as exc:
+            if backend == "fa3":
+                raise
+            print(f"Falling back to torch-sdpa because loading {repo} failed: {exc}")
+    return "torch-sdpa", None
+
+
+ATTN_BACKEND_NAME, FLASH_ATTN_FUNC = _select_attention_backend(cap)
+ATTN_MASK_CACHE = {}
 
 from prepare import MAX_SEQ_LEN, TIME_BUDGET, Tokenizer, make_dataloader, evaluate_bpb
 
@@ -42,6 +71,39 @@ class GPTConfig:
 
 def norm(x):
     return F.rms_norm(x, (x.size(-1),))
+
+
+def attention(q, k, v, window_size):
+    if FLASH_ATTN_FUNC is not None:
+        return FLASH_ATTN_FUNC(q, k, v, causal=True, window_size=window_size)
+
+    q = q.transpose(1, 2)
+    k = k.transpose(1, 2)
+    v = v.transpose(1, 2)
+
+    window_left, window_right = window_size
+    attn_mask = None
+    if 0 <= window_left < q.size(-2):
+        key = (q.size(-2), window_left, window_right, q.device.type, q.device.index)
+        attn_mask = ATTN_MASK_CACHE.get(key)
+        if attn_mask is None:
+            q_pos = torch.arange(q.size(-2), device=q.device)
+            k_pos = torch.arange(k.size(-2), device=k.device)
+            attn_mask = k_pos.unsqueeze(0) <= q_pos.unsqueeze(1)
+            attn_mask &= k_pos.unsqueeze(0) >= (q_pos.unsqueeze(1) - window_left + 1)
+            if window_right >= 0:
+                attn_mask &= k_pos.unsqueeze(0) <= (q_pos.unsqueeze(1) + window_right)
+            ATTN_MASK_CACHE[key] = attn_mask
+
+    y = F.scaled_dot_product_attention(
+        q,
+        k,
+        v,
+        attn_mask=attn_mask,
+        is_causal=attn_mask is None,
+        enable_gqa=q.size(1) != k.size(1),
+    )
+    return y.transpose(1, 2)
 
 
 def has_ve(layer_idx, n_layer):
@@ -90,7 +152,7 @@ class CausalSelfAttention(nn.Module):
         q, k = apply_rotary_emb(q, cos, sin), apply_rotary_emb(k, cos, sin)
         q, k = norm(q), norm(k)
 
-        y = fa3.flash_attn_func(q, k, v, causal=True, window_size=window_size)
+        y = attention(q, k, v, window_size)
         y = y.contiguous().view(B, T, -1)
         y = self.c_proj(y)
         return y
@@ -448,7 +510,7 @@ FINAL_LR_FRAC = 0.0     # final LR as fraction of initial
 
 # Model size
 DEPTH = 8               # number of transformer layers
-DEVICE_BATCH_SIZE = 128  # per-device batch size (reduce if OOM)
+DEFAULT_DEVICE_BATCH_SIZE = 128  # per-device batch size on >=48 GiB GPUs
 
 # ---------------------------------------------------------------------------
 # Setup: tokenizer, model, optimizer, dataloader
@@ -460,7 +522,31 @@ torch.cuda.manual_seed(42)
 torch.set_float32_matmul_precision("high")
 device = torch.device("cuda")
 autocast_ctx = torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16)
-H100_BF16_PEAK_FLOPS = 989.5e12
+gpu_props = torch.cuda.get_device_properties(device)
+gpu_vram_gib = gpu_props.total_memory / 1024 / 1024 / 1024
+GPU_BF16_PEAK_FLOPS = {
+    (9, 0): 989.5e12,  # H100 SXM
+}.get(cap)
+
+device_batch_size_override = os.environ.get("AUTORESEARCH_DEVICE_BATCH_SIZE")
+if device_batch_size_override is not None:
+    device_batch_size = int(device_batch_size_override)
+else:
+    device_batch_size = DEFAULT_DEVICE_BATCH_SIZE if gpu_vram_gib >= 48 else 64
+
+compile_override = os.environ.get("AUTORESEARCH_COMPILE", "auto").strip().lower()
+if compile_override not in {"auto", "0", "1", "false", "true"}:
+    raise ValueError(f"Unsupported AUTORESEARCH_COMPILE value: {compile_override}")
+use_torch_compile = (
+    compile_override == "1"
+    or compile_override == "true"
+    or (compile_override == "auto" and FLASH_ATTN_FUNC is not None)
+)
+
+print(
+    f"GPU: {gpu_props.name} | capability: {cap[0]}.{cap[1]} | VRAM: {gpu_vram_gib:.1f} GiB | "
+    f"attention: {ATTN_BACKEND_NAME} | torch.compile: {'on' if use_torch_compile else 'off'}"
+)
 
 tokenizer = Tokenizer.from_directory()
 vocab_size = tokenizer.get_vocab_size()
@@ -492,7 +578,7 @@ num_params = param_counts['total']
 num_flops_per_token = model.estimate_flops()
 print(f"Estimated FLOPs per token: {num_flops_per_token:e}")
 
-tokens_per_fwdbwd = DEVICE_BATCH_SIZE * MAX_SEQ_LEN
+tokens_per_fwdbwd = device_batch_size * MAX_SEQ_LEN
 assert TOTAL_BATCH_SIZE % tokens_per_fwdbwd == 0
 grad_accum_steps = TOTAL_BATCH_SIZE // tokens_per_fwdbwd
 
@@ -505,12 +591,14 @@ optimizer = model.setup_optimizer(
     weight_decay=WEIGHT_DECAY,
 )
 
-model = torch.compile(model, dynamic=False)
+if use_torch_compile:
+    model = torch.compile(model, dynamic=False)
 
-train_loader = make_dataloader(tokenizer, DEVICE_BATCH_SIZE, MAX_SEQ_LEN, "train")
+train_loader = make_dataloader(tokenizer, device_batch_size, MAX_SEQ_LEN, "train")
 x, y, epoch = next(train_loader)  # prefetch first batch
 
 print(f"Time budget: {TIME_BUDGET}s")
+print(f"Device batch size: {device_batch_size}")
 print(f"Gradient accumulation steps: {grad_accum_steps}")
 
 # Schedules (all based on progress = training_time / TIME_BUDGET)
@@ -584,10 +672,11 @@ while True:
     debiased_smooth_loss = smooth_train_loss / (1 - ema_beta**(step + 1))
     pct_done = 100 * progress
     tok_per_sec = int(TOTAL_BATCH_SIZE / dt)
-    mfu = 100 * num_flops_per_token * TOTAL_BATCH_SIZE / dt / H100_BF16_PEAK_FLOPS
+    mfu = None if GPU_BF16_PEAK_FLOPS is None else 100 * num_flops_per_token * TOTAL_BATCH_SIZE / dt / GPU_BF16_PEAK_FLOPS
     remaining = max(0, TIME_BUDGET - total_training_time)
+    mfu_str = "n/a" if mfu is None else f"{mfu:.1f}%"
 
-    print(f"\rstep {step:05d} ({pct_done:.1f}%) | loss: {debiased_smooth_loss:.6f} | lrm: {lrm:.2f} | dt: {dt*1000:.0f}ms | tok/sec: {tok_per_sec:,} | mfu: {mfu:.1f}% | epoch: {epoch} | remaining: {remaining:.0f}s    ", end="", flush=True)
+    print(f"\rstep {step:05d} ({pct_done:.1f}%) | loss: {debiased_smooth_loss:.6f} | lrm: {lrm:.2f} | dt: {dt*1000:.0f}ms | tok/sec: {tok_per_sec:,} | mfu: {mfu_str} | epoch: {epoch} | remaining: {remaining:.0f}s    ", end="", flush=True)
 
     # GC management (Python's GC causes ~500ms stalls)
     if step == 0:
@@ -610,12 +699,15 @@ total_tokens = step * TOTAL_BATCH_SIZE
 # Final eval
 model.eval()
 with autocast_ctx:
-    val_bpb = evaluate_bpb(model, tokenizer, DEVICE_BATCH_SIZE)
+    val_bpb = evaluate_bpb(model, tokenizer, device_batch_size)
 
 # Final summary
 t_end = time.time()
 startup_time = t_start_training - t_start
-steady_state_mfu = 100 * num_flops_per_token * TOTAL_BATCH_SIZE * (step - 10) / total_training_time / H100_BF16_PEAK_FLOPS if total_training_time > 0 else 0
+steady_state_mfu = None if GPU_BF16_PEAK_FLOPS is None else (
+    100 * num_flops_per_token * TOTAL_BATCH_SIZE * (step - 10) / total_training_time / GPU_BF16_PEAK_FLOPS
+    if total_training_time > 0 else 0
+)
 peak_vram_mb = torch.cuda.max_memory_allocated() / 1024 / 1024
 
 print("---")
@@ -623,7 +715,7 @@ print(f"val_bpb:          {val_bpb:.6f}")
 print(f"training_seconds: {total_training_time:.1f}")
 print(f"total_seconds:    {t_end - t_start:.1f}")
 print(f"peak_vram_mb:     {peak_vram_mb:.1f}")
-print(f"mfu_percent:      {steady_state_mfu:.2f}")
+print(f"mfu_percent:      {'n/a' if steady_state_mfu is None else f'{steady_state_mfu:.2f}'}")
 print(f"total_tokens_M:   {total_tokens / 1e6:.1f}")
 print(f"num_steps:        {step}")
 print(f"num_params_M:     {num_params / 1e6:.1f}")
